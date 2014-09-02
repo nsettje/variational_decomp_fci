@@ -1,0 +1,23 @@
+molecule bh {
+B
+H 1 R
+
+R = 1.19
+
+symmetry c1
+}
+
+plugin_load("./variational_decomp_fci.so")
+
+set {
+  basis sto-3g 
+  df_basis_scf cc-pvdz-jkfit
+}
+
+set plugin_example {
+  print 1
+}
+
+energy('scf')
+
+plugin("./variational_decomp_fci.so")

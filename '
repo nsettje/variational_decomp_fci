@@ -1,0 +1,1302 @@
+#include <libplugin/plugin.h>
+#include <psi4-dec.h>
+#include <libparallel/parallel.h>
+#include <liboptions/liboptions.h>
+#include <libmints/mints.h>
+#include <libpsio/psio.hpp>
+#include "MOint.h"
+#include "permute.h"
+#include "slaterd.h"
+
+/*Matrix Decomposition Full Configuration Interaction
+ Based on Koch, Henrik, and Esper Dalgaard. "A variational matrix decomposition applied to full configuration-interaction calculations." Chemical physics letters 198.1 (1992): 51-58.
+
+Most of the functionality is an implementation of equation 24 and its counterpart in beta
+*/
+
+
+
+INIT_PLUGIN
+
+using namespace boost;
+
+namespace psi{ namespace variational_decomp_fci {
+
+extern "C" 
+int read_options(std::string name, Options& options)
+{
+    if (name == "VARIATIONAL_DECOMP_FCI"|| options.read_globals()) {
+        /*- The amount of information printed to the output file -*/
+        options.add_int("PRINT", 1);
+    }
+
+    return true;
+}
+
+//IMPORTANT ELECTRONIC CONSTANTS
+typedef struct{
+	int nmo;
+	int alphae;
+	int betae;
+	double **mo_OEI;
+	double *mo_TEI;
+} Ecnst;
+
+extern "C" {
+	extern struct{
+		int *MP;
+		int *LP;
+		double *GTOL;
+		double *STPMIN;
+		double *STPMAX;
+	} lb2_;
+}
+
+void normalize(double *vec, int length);
+int davidP(int state, int M, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double *mo_TEI,int print);
+int davidQ(int state, int M, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double *mo_TEI,int print);
+void get_approx_diag_invHessP(int state, double *hessDiagP, double E, double **sigmaP, double **gradientP, int n_Aterms, int alphae, int nmo);
+void get_energy_gradientP(int state, double E, double **gradientP, double **sigmaP, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double *mo_TEI);
+void get_energy_gradientQ(int state, double E, double **gradientP, double **sigmaP, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double *mo_TEI);
+double get_energyP(int state, double **P, double **sigmaP, int n_Aterms, int alphae, int nmo);
+double get_energyQ(int state, double **Q, double **sigmaQ, int n_Bterms, int betae, int nmo);
+void get_factored_sigmaP(int sigmaState,int pState,int qState, double **sigmaP, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI);
+void get_factored_sigmaQ(int sigmaState,int pqState, double **sigmaQ, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI);
+void get_factored_sigmaPAA(int sigmaState, int pState,int qState,double **sigmaP, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI);
+void get_factored_sigmaPBB(int sigmaState,int pState,int qState, double **sigmaP, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI);
+void get_factored_sigmaPAB(int sigmaState,int pState, int qState,double **sigmaP, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI);
+void get_factored_sigmaQAA(int sigmaState,int pqState, double **sigmaQ, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI);
+void get_factored_sigmaQBB(int sigmaState,int pqState, double **sigmaQ, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI);
+void get_factored_sigmaQAB(int sigmaState,int pqState, double **sigmaQ, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI);
+extern "C" void lbfgs_(int *N, int *M, double *X, double *F, double *G, int *DIAGCO, double *DIAG, int *IPRINT, double *EPS, double *XTOL, double *W, int *IFLAG);
+extern "C" 
+PsiReturnType variational_decomp_fci(Options& options)
+{
+    int print = options.get_int("PRINT");
+/* INITIALIZATIONS */
+	//pointers to important constants
+	int *nmo_ = new int; //# molecular orbitals
+	int *alphae_ = new int; //# alpha electrons
+	int *betae_ = new int; //# beta electrons
+	double *eSCF_ = new double;
+	const char *molname = new char[80], *basisname = new char[80]; //molecule name and basis name
+
+	//find important constants
+	//function in MOint.h
+	initialize_MO_constants(nmo_,alphae_,betae_,eSCF_,molname,basisname);
+	//recast pointers as ints
+	int nmo = *(nmo_);
+	int alphae = *alphae_;
+	int betae = *betae_;
+	double eSCF = *(eSCF_);
+	delete [] eSCF_;
+	delete [] nmo_;
+	delete [] alphae_;
+	delete [] betae_;
+	//printf("nmo = %d\na = %d\nb = %d\n",nmo,alphae,betae);
+
+	//initialize one-electron and two-electron integrals
+	double **mo_OEI=block_matrix(nmo,nmo); //Pointer to OEI in MO basis
+	double *mo_TEI=init_array(nmo*nmo*nmo*nmo);
+
+	//transform MOs, storing in **OEI and *TEI arrays
+	//function in MOint.h
+	MO_transform(mo_OEI,mo_TEI,nmo);
+
+	//add TEI to OEI to build matrix of hkl'
+	for(int k =0;k<nmo;k++){
+		for(int l=0;l<nmo;l++){
+			for(int j =0;j<nmo;j++){
+				mo_OEI[k][l]-=0.5*mo_TEI[k*nmo*nmo*nmo+j*nmo*nmo+j*nmo+l];
+			}
+		}
+	}
+
+	//number of determinants
+	int astringcount = nchoosek(nmo,alphae);
+	int bstringcount = nchoosek(nmo,betae);                                                            
+	//int N = astringcount*bstringcount;                                                         
+	/*double **H = block_matrix(astringcount*bstringcount,astringcount*bstringcount);
+	build_full_Hamiltonian(H,mo_OEI,mo_TEI,alphae,betae,nmo);
+	print_mat(H,astringcount*bstringcount,astringcount*bstringcount,outfile);
+	free_block(H);*/
+	//initialize P and Q
+	int max_terms = 2; //maximum number of terms to add to wfn expansion
+	int max_states = 1;
+	double **P = block_matrix(max_states,max_terms*astringcount);
+	double **Q = block_matrix(max_states,max_terms*bstringcount);
+
+	int state = 0;
+	//for(int i=0;i<max_terms;i++){
+	//
+		double normA = 1/sqrt(astringcount);
+		for(int j=0;j<astringcount;j++){
+		//	P[state][j]=normA;
+		}
+		double normB = 1/sqrt(bstringcount);
+		for(int j=0;j<bstringcount;j++){
+		//	Q[state][j]=normB;
+		}
+//}
+	//P[state][0]=2.0;
+	P[state][0]=1.0;
+	Q[state][0]=1.0;
+	//normalize(&(P[0][0]), astringcount);
+	double **sigmaP = block_matrix(max_terms,astringcount);
+	double **sigmaQ = block_matrix(max_terms,bstringcount);
+	
+	int n_Aterms = max_terms;
+	int n_Bterms = max_terms;	
+	//get_factored_sigmaP(state, sigmaP, P, Q, n_Aterms, n_Bterms, alphae, betae, nmo, mo_OEI,  mo_TEI);
+	for(int i=0;i<astringcount;i++){
+		//printf("%lf\n",sigmaP[state][i]);
+	}
+		//printf("%lf\n",sigmaP[state][0]);
+	//printf("--------\n");
+	//get_factored_sigmaQ(state, sigmaQ, P, Q, n_Aterms, n_Bterms, alphae, betae, nmo, mo_OEI,  mo_TEI);
+	for(int i=0;i<bstringcount;i++){
+		//printf("%lf\n",sigmaQ[state][i]);
+	}
+	//	printf("%lf\n",sigmaQ[state][0]);
+//	printf("\n%lf\n",eSCF);
+	int N = astringcount;
+	int M = 6;
+	int DIAGCO = 0;
+	/*P[state][1]=-0.520465;
+	P[state][2]=0.313687;
+	P[state][3]=-0.794176;*/
+	//get_factored_sigmaP(state,state, sigmaP, P, Q, 1, 1, alphae, betae, nmo, mo_OEI,  mo_TEI);
+	double Ee = get_energyP(0,P,sigmaP, 1, alphae, nmo);	
+	printf("E = %lf\n",Ee);
+	for(int i=0;i<astringcount;i++){
+		printf("%lf\n",sigmaP[state][i]);
+	}
+	printf("DAVIDSON \n");
+	int roots = 2;
+	for(int i=0;i<1;i++){
+		printf("DAVP %d\n",i);
+		davidP(0,roots, P, Q, 1, 1, alphae, betae, nmo, mo_OEI, mo_TEI,1);
+		for(int j=0;j<astringcount;j++){
+			printf("%lf ",P[state][j]);
+		}
+		printf("\n");
+		printf("DAVQ %d\n",i);
+		//davidQ(0,roots, P, Q, 1, 1, alphae, betae, nmo, mo_OEI, mo_TEI,1);
+		for(int j=0;j<bstringcount;j++){
+			printf("%lf ",Q[state][j]);
+		}
+		printf("\n");
+	}
+	/*double *DIAG = init_array(N);
+	for(int i=0;i<astringcount;i++){
+		DIAG[i]=1.0;//sqrt(astringcount);
+	}
+	int *IPRINT = init_int_array(2);
+	double EPS = 10e-3;
+	double XTOL = 10e-16;
+	double *W = init_array(N*(2*M+1)+2*M);
+	int IFLAG = 0; 
+	printf("LBFGS\n");
+	int iter = 0;
+		double *G = init_array(N);
+	while(iter<2){
+		printf("iter %d\n",iter);
+		IPRINT[0] = 1;
+		IPRINT[1] = 3;
+		for(int i=0;i<astringcount;i++){
+			sigmaP[state][i]=0.0;
+		}
+		for(int i=0;i<bstringcount;i++){
+			sigmaQ[state][i]=0.0;
+		}
+		//get_factored_sigmaP(state, sigmaP, P, Q, 1, 1, alphae, betae, nmo, mo_OEI,  mo_TEI);
+		get_factored_sigmaQ(state, sigmaQ, P, Q, 1, 1, alphae, betae, nmo, mo_OEI,  mo_TEI);
+		double F = get_energyQ(0,Q,sigmaQ, 1, betae, nmo);	
+		double f = get_energyP(0,P,sigmaP, 1, alphae, nmo);	
+		printf("E = %lf\n",F);
+		printf("E = %lf\n",f);
+		//double *G = init_array(N);
+		get_energy_gradientP(0,F, &G, sigmaP, P, Q, 1, 1, alphae, betae, nmo, mo_OEI, mo_TEI);
+		double *hessDiagP = init_array(N);
+		get_approx_diag_invHessP(state, hessDiagP, F, sigmaP, &G, 1, alphae, nmo);
+		lbfgs_(&N, &M, &(P[state][0]), &f, G, &DIAGCO, hessDiagP, IPRINT, &EPS, &XTOL, W, &IFLAG);
+		free(hessDiagP);
+		for(int i=0;i<astringcount;i++){
+			printf("%lf\n",P[state][i]);
+		}
+		//normalize(&(P[state][0]),astringcount);
+		printf("IFLAG = %d\n",IFLAG);
+		if(IFLAG==1){IFLAG = 0;}
+		//free(G);
+		iter++;
+	}*/
+	free_block(sigmaP);
+	free_block(sigmaQ);
+
+	free_block(P);
+	free_block(Q);
+		
+	free(mo_TEI);
+	free_block(mo_OEI);
+	
+/* END INITIALIZATIONS */
+return Success;
+}
+
+void normalize(double *vec, int length){
+	double norm = C_DDOT(length,vec,1,vec,1);
+	norm = sqrt(norm);
+	norm = 1/norm;
+	C_DSCAL(length,norm,vec,1);
+}
+
+//compute sigma^P for a given state up to a given number of alpha and beta terms in the trial wavefunction
+void get_factored_sigmaP(int sigmaState, int pState, int qState, double **sigmaP, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI){
+	get_factored_sigmaPAA(sigmaState,pState,qState, sigmaP, P, Q, n_Aterms, n_Bterms, alphae, betae, nmo, mo_OEI,  mo_TEI);
+	//printf("%lf\n",sigmaP[state][0]);
+	get_factored_sigmaPBB(sigmaState,pState,qState, sigmaP, P, Q, n_Aterms, n_Bterms, alphae, betae, nmo, mo_OEI,  mo_TEI);
+	//printf("%lf\n",sigmaP[state][0]);
+	get_factored_sigmaPAB(sigmaState,pState,qState, sigmaP, P, Q, n_Aterms, n_Bterms, alphae, betae, nmo, mo_OEI,  mo_TEI);
+	//printf("%lf\n",sigmaP[state][0]);
+}
+
+//compute sigma^Q for a given state up to a given number of alpha and beta terms in the trial wavefunction
+void get_factored_sigmaQ(int sigmaState,int pqState, double **sigmaQ, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI){
+	get_factored_sigmaQAA(sigmaState,pqState, sigmaQ, P, Q, n_Aterms, n_Bterms, alphae, betae, nmo, mo_OEI,  mo_TEI);
+	//printf("%lf\n",sigmaQ[state][0]);
+	get_factored_sigmaQBB(sigmaState,pqState, sigmaQ, P, Q, n_Aterms, n_Bterms, alphae, betae, nmo, mo_OEI,  mo_TEI);
+	//printf("%lf\n",sigmaQ[state][0]);
+	get_factored_sigmaQAB(sigmaState,pqState, sigmaQ, P, Q, n_Aterms, n_Bterms, alphae, betae, nmo, mo_OEI,  mo_TEI);
+	//printf("%lf\n",sigmaQ[state][0]);
+}
+
+//compute alpha-alpha component of sigma^P for given state
+void get_factored_sigmaPAA(int sigmaState, int pState, int qState, double **sigmaP, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI){
+	//dummy variables
+	int i,j,k,l,I,J,K,L;
+	//# strings
+	int astringcount = nchoosek(nmo,alphae);
+	int bstringcount = nchoosek(nmo,betae); 
+	//initial strings
+	int *Iaprimestring = init_int_array(alphae);
+	int *Iastring = init_int_array(alphae);
+	int *Kastring = init_int_array(alphae);
+	int *Jastring = init_int_array(alphae); 
+	for(i=0;i<alphae;i++){
+		Iastring[i]=i;
+		Iaprimestring[i]=i;
+	}
+	//double QB_prefactor = 0.0;
+	//pre-compute sum_beta Q_beta*Q_beta
+	for(i=0;i<n_Bterms;i++){
+		//QB_prefactor+=C_DDOT(bstringcount,&(Q[state][i*(bstringcount)]),1,&(Q[state][i*(bstringcount)]),1);
+	}
+//	printf("QB = %lf\n",QB_prefactor);
+	//loop up to highest excitation included in alpha wfn
+	for(i=0;i<n_Aterms-1;i++){
+		next_combination(Iaprimestring,nmo,alphae);
+	}	
+	//loop over alpha 
+	for(I=0;I<n_Aterms;I++){
+		//first excitations
+		for(l=0;l<alphae;l++){
+			//one-electron coupling
+			//only excite up to strings that can match Iaprime
+			for(k=0;k<alphae;k++){
+				int sgnkl = excite(Iastring,Iaprimestring[k],Iastring[l],alphae,nmo,Kastring);
+				int Kindex = stradr(Kastring,alphae,nmo);
+				if(Kindex == n_Aterms-1){
+					for(J=0;J<astringcount;J++){
+						sigmaP[sigmaState][J]+=/*QB_prefactor*/sgnkl*mo_OEI[k][l]*P[pState][I*astringcount+J];
+					}
+					//break;
+				}
+			}
+			//two-electron coupling
+			for(k=0;k<nmo;k++){
+				int sgnkl = excite(Iastring,k,l,alphae,nmo,Kastring);
+				//second excitations
+				for(i=0;i<alphae;i++){
+					for(j=0;j<nmo;j++){
+						int sgnij = excite(Kastring,i,j,alphae,nmo,Jastring);
+						int Jindex = stradr(Jastring,alphae,nmo);
+						if(Jindex == n_Aterms-1){
+							for(J=0;J<astringcount;J++){
+								sigmaP[sigmaState][J]+=0.5/*QB_prefactor*/*sgnkl*sgnij*mo_TEI[i*nmo*nmo*nmo+j*nmo*nmo+k*nmo+l]*P[pState][I*astringcount+J];
+							}
+						}
+					}
+				}
+			}
+		}
+		next_combination(Iastring,nmo,alphae);	
+	}
+	free(Iaprimestring);
+	free(Iastring);
+	free(Kastring);
+	free(Jastring);
+}
+
+//compute beta-beta component of sigma^P
+void get_factored_sigmaPBB(int sigmaState, int pState, int qState, double **sigmaP, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI){
+	//dummy variables
+	int i,j,k,l,I,J,K,L;
+	//# strings
+	int astringcount = nchoosek(nmo,alphae);
+	int bstringcount = nchoosek(nmo,betae); 
+	//initial strings
+	int *Ibstring = init_int_array(betae);
+	int *Ibprimestring = init_int_array(betae);
+	int *Kbstring = init_int_array(betae);
+	int *Jbstring = init_int_array(betae); 
+	for(i=0;i<betae;i++){
+		Ibstring[i]=i;
+		Ibprimestring[i]=i;
+	}
+	//loop over beta prime
+	for(I=0;I<n_Bterms;I++){
+		//loop over beta
+		for(J=0;J<n_Bterms;J++){
+			//first excitations
+			for(l=0;l<betae;l++){
+				//one-electron coupling
+				for(k=0;k<betae;k++){
+					int sgnkl = excite(Ibstring,Ibprimestring[k],Ibstring[l],betae,nmo,Kbstring);
+					int Kindex = stradr(Kbstring,betae,nmo);
+					if(Kindex == I){
+						double Qb_term = C_DDOT(bstringcount,&(Q[qState][I*bstringcount]),1,&(Q[qState][J*bstringcount]),1);
+						for(K=0;K<astringcount;K++){
+							sigmaP[sigmaState][K]+=sgnkl*Qb_term*mo_OEI[k][l]*P[pState][(n_Aterms-1)*astringcount+K];
+						}
+						break;
+					}
+				}
+				//two-electron coupling
+				for(k=0;k<nmo;k++){
+					int sgnkl = excite(Ibstring,k,l,betae,nmo,Kbstring);
+					//second excitations
+					for(i=0;i<betae;i++){
+						for(j=0;j<nmo;j++){
+							int sgnij = excite(Kbstring,i,j,betae,nmo,Jbstring);
+							int Jindex = stradr(Jbstring,betae,nmo);
+							if(Jindex == I){
+								double Qb_term = C_DDOT(bstringcount,&(Q[qState][I*bstringcount]),1,&(Q[qState][J*bstringcount]),1);
+								for(K=0;K<astringcount;K++){
+									sigmaP[sigmaState][K]+=0.5*sgnkl*sgnij*Qb_term*mo_TEI[i*nmo*nmo*nmo+j*nmo*nmo+k*nmo+l]*P[pState][(n_Aterms-1)*astringcount+K];
+								}
+							}
+						}
+					}
+				}
+			}
+			next_combination(Ibstring,nmo,betae);	
+		}
+		next_combination(Ibprimestring,nmo,betae);	
+	}
+	free(Ibprimestring);
+	free(Ibstring);
+	free(Kbstring);
+	free(Jbstring);
+}
+
+//compute alpha-beta component of sigma^P
+void get_factored_sigmaPAB(int sigmaState, int pState, int qState, double **sigmaP, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI){
+	//dummy variables
+	int i,j,k,l,I,J,K,L;
+	//# strings
+	int astringcount = nchoosek(nmo,alphae);
+	int bstringcount = nchoosek(nmo,betae); 
+	//initial strings
+	int *Ibprimestring = init_int_array(betae);
+	int *Ibstring = init_int_array(betae);
+	int *Kbstring = init_int_array(betae);
+	int *Iastring = init_int_array(alphae); 
+	int *Iaprimestring = init_int_array(alphae); 
+	int *Kastring = init_int_array(alphae); 
+	for(i=0;i<alphae;i++){
+		Iastring[i]=i;
+		Iaprimestring[i]=i;
+	}
+	for(i=0;i<betae;i++){
+		Ibstring[i]=i;
+		Ibprimestring[i]=i;
+	}
+	//initialize beta ij density matrix
+	double **beta_density = block_matrix(nmo,nmo);
+	//loop over beta prime
+	for(I=0;I<n_Bterms;I++){	
+		//loop over beta
+		for(J=0;J<n_Bterms;J++){
+			//excitation ij
+			for(i=0;i<betae;i++){
+				for(j=0;j<betae;j++){
+					//only loop over i in the bra string and j in the ket string
+					int sgnij = excite(Ibstring,Ibprimestring[i],Ibstring[j],betae,nmo,Kbstring);
+					int Kindex = stradr(Kbstring,betae,nmo);
+					if(Kindex == I && sgnij != 0){
+						beta_density[Ibprimestring[i]][Ibstring[j]]+=sgnij*C_DDOT(bstringcount,&(Q[qState][I*bstringcount]),1,&(Q[qState][J*bstringcount]),1);
+					}
+				}
+			}
+			next_combination(Ibstring,nmo,betae);
+		}
+		next_combination(Ibprimestring,nmo,betae);
+	}
+	//highest excitation for alpha'
+	for(i=0;i<n_Aterms-1;i++){
+		next_combination(Iaprimestring,nmo,alphae);
+	}
+	//loop over alpha 
+	for(I=0;I<n_Aterms;I++){
+		//excitations kl
+		for(k=0;k<alphae;k++){
+			for(l=0;l<alphae;l++){
+				int sgnkl = excite(Iastring,Iaprimestring[k],Iastring[l],alphae,nmo,Kastring);
+				int Kindex = stradr(Kastring,alphae,nmo);
+				if(Kindex == n_Aterms-1 && sgnkl != 0 ){
+					for(i=0;i<nmo;i++){
+						for(j=0;j<nmo;j++){
+							for(K=0;K<astringcount;K++){
+								sigmaP[sigmaState][K]+=beta_density[i][j]*sgnkl*mo_TEI[i*nmo*nmo*nmo+j*nmo*nmo+k*nmo+l]*P[pState][I*astringcount+K];
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	free_block(beta_density);
+	free(Ibprimestring);
+	free(Ibstring);
+	free(Kbstring);
+	free(Iastring);
+	free(Iaprimestring);
+	free(Kastring);
+}
+
+//compute alpha-alpha component of sigma^Q
+void get_factored_sigmaQAA(int sigmaState, int pqState, double **sigmaQ, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI){
+	//dummy variables
+	int i,j,k,l,I,J,K,L;
+	//# strings
+	int astringcount = nchoosek(nmo,alphae);
+	int bstringcount = nchoosek(nmo,betae); 
+	//initial strings
+	int *Iastring = init_int_array(alphae);
+	int *Iaprimestring = init_int_array(alphae);
+	int *Kastring = init_int_array(alphae);
+	int *Jastring = init_int_array(alphae); 
+	for(i=0;i<alphae;i++){
+		Iastring[i]=i;
+		Iaprimestring[i]=i;
+	}
+	//loop over alpha prime
+	for(I=0;I<n_Aterms;I++){
+		//loop over alpha
+		for(J=0;J<n_Aterms;J++){
+			//first excitations
+			for(l=0;l<alphae;l++){
+				//one-electron coupling
+				for(k=0;k<alphae;k++){
+					int sgnkl = excite(Iastring,Iaprimestring[k],Iastring[l],alphae,nmo,Kastring);
+					int Kindex = stradr(Kastring,alphae,nmo);
+					if(Kindex == I){
+						double Pa_term = C_DDOT(astringcount,&(P[pqState][I*astringcount]),1,&(P[pqState][J*astringcount]),1);
+						for(K=0;K<bstringcount;K++){
+							sigmaQ[sigmaState][K]+=sgnkl*Pa_term*mo_OEI[k][l]*Q[pqState][(n_Bterms-1)*bstringcount+K];
+						}
+						break;
+					}
+				}
+				//two-electron coupling
+				for(k=0;k<nmo;k++){
+					int sgnkl = excite(Iastring,k,l,alphae,nmo,Kastring);
+					//second excitations
+					for(i=0;i<alphae;i++){
+						for(j=0;j<nmo;j++){
+							int sgnij = excite(Kastring,i,j,alphae,nmo,Jastring);
+							int Jindex = stradr(Jastring,alphae,nmo);
+							if(Jindex == I){
+								double Pa_term = C_DDOT(astringcount,&(P[pqState][I*astringcount]),1,&(P[pqState][J*astringcount]),1);
+								for(K=0;K<bstringcount;K++){
+									sigmaQ[sigmaState][K]+=0.5*sgnkl*sgnij*Pa_term*mo_TEI[i*nmo*nmo*nmo+j*nmo*nmo+k*nmo+l]*Q[pqState][(n_Bterms-1)*bstringcount+K];
+								}
+							}
+						}
+					}
+				}
+			}
+			next_combination(Iastring,nmo,alphae);	
+		}
+		next_combination(Iaprimestring,nmo,alphae);	
+	}
+	free(Iastring);
+	free(Iaprimestring);
+	free(Kastring);
+	free(Jastring);
+}
+
+
+//compute beta-beta component of sigma^Q
+void get_factored_sigmaQBB(int sigmaState, int pqState, double **sigmaQ, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI){
+	//dummy variables
+	int i,j,k,l,I,J,K,L;
+	//# strings
+	int astringcount = nchoosek(nmo,alphae);
+	int bstringcount = nchoosek(nmo,betae); 
+	//initial strings
+	int *Ibprimestring = init_int_array(betae);
+	int *Ibstring = init_int_array(betae);
+	int *Kbstring = init_int_array(betae);
+	int *Jbstring = init_int_array(betae); 
+	for(i=0;i<betae;i++){
+		Ibstring[i]=i;
+		Ibprimestring[i]=i;
+	}
+	double PA_prefactor = 0.0;
+	//pre-compute sum_beta Q_beta*Q_beta
+	for(i=0;i<n_Aterms;i++){
+		PA_prefactor+=C_DDOT(astringcount,&(P[pqState][i*astringcount]),1,&(P[pqState][i*astringcount]),1);
+	}
+	//loop up to highest excitation included in beta wfn
+	for(i=0;i<n_Bterms-1;i++){
+		next_combination(Ibprimestring,nmo,betae);
+	}	
+	//loop over beta
+	for(I=0;I<n_Bterms;I++){
+		//first excitations
+		for(l=0;l<betae;l++){
+			//one-electron coupling
+			for(k=0;k<betae;k++){
+				int sgnkl = excite(Ibstring,Ibprimestring[k],Ibstring[l],betae,nmo,Kbstring);
+				int Kindex = stradr(Kbstring,betae,nmo);
+				if(Kindex == n_Bterms-1){
+					for(J=0;J<bstringcount;J++){
+						sigmaQ[sigmaState][J]+=sgnkl*PA_prefactor*mo_OEI[k][l]*Q[pqState][I*bstringcount+J];
+					}
+					break;
+				}
+			}
+			//two-electron coupling
+			for(k=0;k<nmo;k++){
+				int sgnkl = excite(Ibstring,k,l,betae,nmo,Kbstring);
+				//second excitations
+				for(i=0;i<betae;i++){
+					for(j=0;j<nmo;j++){
+						int sgnij = excite(Kbstring,i,j,betae,nmo,Jbstring);
+						int Jindex = stradr(Jbstring,betae,nmo);
+						if(Jindex == n_Bterms-1){
+							for(J=0;J<bstringcount;J++){
+								sigmaQ[sigmaState][J]+=0.5*PA_prefactor*sgnkl*sgnij*mo_TEI[i*nmo*nmo*nmo+j*nmo*nmo+k*nmo+l]*Q[pqState][I*bstringcount+J];
+							}
+						}
+					}
+				}
+			}
+		}
+		next_combination(Ibstring,nmo,betae);	
+	}
+	free(Ibstring);
+	free(Ibprimestring);
+	free(Kbstring);
+	free(Jbstring);
+}
+
+//compute alpha-beta component of sigma^Q
+void get_factored_sigmaQAB(int sigmaState, int pqState, double **sigmaQ, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double * mo_TEI){
+	//dummy variables
+	int i,j,k,l,I,J,K,L;
+	//# strings
+	int astringcount = nchoosek(nmo,alphae);
+	int bstringcount = nchoosek(nmo,betae); 
+	//initial strings
+	int *Ibprimestring = init_int_array(betae);
+	int *Ibstring = init_int_array(betae);
+	int *Kbstring = init_int_array(betae);
+	int *Iastring = init_int_array(alphae); 
+	int *Iaprimestring = init_int_array(alphae); 
+	int *Kastring = init_int_array(alphae); 
+	for(i=0;i<alphae;i++){
+		Iastring[i]=i;
+		Iaprimestring[i]=i;
+	}
+	for(i=0;i<betae;i++){
+		Ibstring[i]=i;
+		Ibprimestring[i]=i;
+	}
+	//highest excitation for beta'
+	for(i=0;i<n_Bterms-1;i++){
+		next_combination(Ibprimestring,nmo,betae);
+	}
+	//loop over alpha prime	
+/*	for(I=0;I<n_Aterms;I++){
+		//loop over alpha
+		for(J=0;J<n_Aterms;J++){
+			//alpha excitations
+			for(k=0;k<alphae;k++){
+				for(l=0;l<alphae;l++){
+					int sint gnkl = excite(Iastring,Iaprimestring[k],Iastring[l],alphae,nmo,Kastring);
+					int Kaindex = stradr(Kastring,alphae,nmo);
+					if(Kaindex == I){
+						double Pa_term = C_DDOT(astringcount,&(P[state][I*astringcount]),1,&(P[state][J*astringcount]),1);
+						//beta excitations
+						for(K=0;K<n_Bterms;K++){
+							for(i=0;i<betae;i++){
+								for(j=0;j<betae;j++){
+									int sgnij = excite(Ibstring,Ibprimestring[i],Ibstring[j],betae,nmo,Kbstring);
+									int Kbindex = stradr(Kbstring,betae,nmo);
+									if(Kbindex == n_Bterms-1){
+										//update sigma
+										double TEI_term = Pa_term*mo_TEI[i*nmo*nmo*nmo+j*nmo*nmo+k*nmo+l];
+										for(L=0;L<bstringcount;L++){
+											sigmaQ[state][L]+=TEI_term*Q[state][K*bstringcount+L];
+										}
+									}
+								}
+							}
+							next_combination(Ibstring,nmo,betae);
+						}	
+					}
+				}
+			}
+			next_combination(Iaprimestring,nmo,alphae);
+		}
+		next_combination(Iastring,nmo,alphae);
+	}*/
+	//initialize alpha ij density matrix
+	double **alpha_density = block_matrix(nmo,nmo);
+	//loop over alpha prime
+	for(I=0;I<n_Aterms;I++){	
+		//loop over alpha 
+		for(J=0;J<n_Aterms;J++){
+			//excitation ij
+			for(i=0;i<alphae;i++){
+				for(j=0;j<alphae;j++){
+					//only loop over i in the bra string and j in the ket string
+					int sgnij = excite(Iastring,Iaprimestring[i],Iastring[j],alphae,nmo,Kastring);
+					int Kindex = stradr(Kastring,alphae,nmo);
+					if(Kindex == I && sgnij != 0){
+						alpha_density[Iaprimestring[i]][Iastring[j]]+=sgnij*C_DDOT(astringcount,&(P[pqState][I*astringcount]),1,&(P[pqState][J*astringcount]),1);
+					}
+				}
+			}
+			next_combination(Iastring,nmo,alphae);
+		}
+		next_combination(Iaprimestring,nmo,alphae);
+	}
+	//highest excitation for beta'
+	for(i=0;i<n_Bterms-1;i++){
+		next_combination(Ibprimestring,nmo,betae);
+	}
+	//loop over beta 
+	for(I=0;I<n_Bterms;I++){
+		//excitations kl
+		for(k=0;k<betae;k++){
+			for(l=0;l<betae;l++){
+				int sgnkl = excite(Ibstring,Ibprimestring[k],Ibstring[l],betae,nmo,Kbstring);
+				int Kindex = stradr(Kbstring,betae,nmo);
+				if(Kindex == n_Bterms-1 && sgnkl != 0 ){
+					for(i=0;i<nmo;i++){
+						for(j=0;j<nmo;j++){
+							for(K=0;K<bstringcount;K++){
+								sigmaQ[sigmaState][K]+=alpha_density[i][j]*sgnkl*mo_TEI[i*nmo*nmo*nmo+j*nmo*nmo+k*nmo+l]*Q[pqState][I*bstringcount+K];
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	free_block(alpha_density);
+
+
+	free(Ibstring);
+	free(Ibprimestring);
+	free(Kbstring);
+	free(Iastring);
+	free(Iaprimestring);
+	free(Kastring);
+}
+
+
+	//get_factored_sigmaP(state, sigmaP, P, Q, n_Aterms, n_Bterms, alphae, betae, nmo, mo_OEI,  mo_TEI);
+
+double get_energyP(int state, double **P, double **sigmaP, int n_Aterms, int alphae, int nmo){
+	int astringcount = nchoosek(nmo,alphae);
+	double E = C_DDOT(astringcount,&(sigmaP[state][0]),1,&(P[state][(n_Aterms-1)*astringcount]),1);
+	return E;
+}
+
+double get_energyQ(int state, double **Q, double **sigmaQ, int n_Bterms, int betae, int nmo){
+	int bstringcount = nchoosek(nmo,betae);
+	double E = C_DDOT(bstringcount,&(sigmaQ[state][0]),1,&(Q[state][(n_Bterms-1)*bstringcount]),1);
+	return E;
+}
+
+//dE/dP_alpha = 2*(sigma_alpha - E*P_alpha)
+//make sure the newest addition to the wavefunction is normalized wrt previous iterations
+void get_energy_gradientP(int state, double E, double **gradientP, double **sigmaP, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double *mo_TEI){
+	int astringcount = nchoosek(nmo,alphae);
+	E*=-1;
+	C_DCOPY(astringcount,&(sigmaP[state][0]),1,&(gradientP[state][0]),1);
+	C_DAXPY(astringcount,E,&(P[state][(n_Aterms-1)*astringcount]),1,&(gradientP[state][0]),1);
+	C_DSCAL(astringcount,2,&(gradientP[state][0]),1);
+}
+
+//dE/dP_alpha = 2*(sigma_alpha - E*P_alpha)
+//make sure the newest addition to the wavefunction is normalized wrt previous iterations
+void get_energy_gradientQ(int state, double E,double **gradientQ, double **sigmaQ, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double *mo_TEI){
+	int bstringcount = nchoosek(nmo,betae);
+	E*=-1;
+	C_DCOPY(bstringcount,&(sigmaQ[state][0]),1,&(gradientQ[state][0]),1);
+	C_DAXPY(bstringcount,E,&(P[state][(n_Bterms-1)*bstringcount]),1,&(gradientQ[state][0]),1);
+	C_DSCAL(bstringcount,2,&(gradientQ[state][0]),1);
+}
+
+void get_approx_diag_invHessP(int state, double *hessDiagP, double E, double **sigmaP, double **gradientP, int n_Aterms, int alphae, int nmo){
+
+	int astringcount = nchoosek(nmo,alphae);
+	for(int i=0;i<astringcount;i++){
+		hessDiagP[i]=sigmaP[state][i]*gradientP[state][i]+E;
+	}
+	C_DSCAL(astringcount,-2,&(gradientP[state][0]),1);
+}
+
+int davidP(int state, int M, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double *mo_TEI,int print)
+{
+	int i, j, k, L, I;
+	double minimum;
+	int min_pos, numf, iter, *conv, converged, maxdim, skip_check;
+	int *small2big, init_dim;
+	int smart_guess =1;
+	double *Adiag, **b, **bnew, **sigma, **G;
+	double *lambda, **alpha, **f, *lambda_old;
+	double norm, denom, diff;
+	double BIGNUM = 10E100;
+	int MAXIT = 1000;
+	double cutoff = 10E-6;
+	int astringcount = nchoosek(nmo,alphae);
+	int N = astringcount;
+	maxdim = 2 * M;
+
+	b = block_matrix(maxdim, N);  /* current set of guess vectors,
+				   stored by row */
+	bnew = block_matrix(M, N); /* guess vectors formed from old vectors,
+				stored by row*/
+	//sigma = block_matrix(N, maxdim); /* sigma vectors, stored by column */
+	sigma = block_matrix(maxdim,N); /* sigma vectors, stored by row*/
+	G = block_matrix(maxdim, maxdim); /* Davidson mini-Hamitonian */
+	f = block_matrix(maxdim, N); /* residual eigenvectors, stored by row */
+	alpha = block_matrix(maxdim, maxdim); /* eigenvectors of G */
+	lambda = init_array(maxdim); /* eigenvalues of G */
+	lambda_old = init_array(maxdim); /* approximate roots from previous
+				      iteration */
+	if(smart_guess) { /* Use eigenvectors of a sub-matrix as initial guesses */
+		if(N > 7*M){
+			init_dim = 7*M;
+		}
+		else{ 
+			init_dim = M;
+		}
+		double **initG = block_matrix(init_dim,init_dim);
+		Adiag = init_array(N);
+		small2big = init_int_array(7*M);
+		for(i=0; i < N; i++) { 
+			Adiag[i] = build_single_Hamiltonian_element(i*astringcount+n_Bterms-1,i*astringcount+n_Bterms-1,mo_OEI,mo_TEI,alphae,betae,nmo);
+			printf("diag(%d) <%d|H|%d> = %lf\n",i,i*astringcount+n_Bterms-1,i*astringcount+n_Bterms-1,Adiag[i]);
+		}
+		for(i=0; i < init_dim; i++) {
+			minimum = Adiag[0];
+			min_pos = 0;
+			for(j=1; j < N; j++){
+				if(Adiag[j] < minimum) {	
+					minimum = Adiag[j]; 
+					min_pos = j; 
+					small2big[i] = j; 
+				}
+			}
+			Adiag[min_pos] = BIGNUM;
+			lambda_old[i] = minimum;
+		}
+		for(i=0; i < init_dim; i++) {
+			for(j=0; j < init_dim; j++){
+			//G[i][j] = A[small2big[i]][small2big[j]];
+				initG[i][j] = build_single_Hamiltonian_element(small2big[i]*astringcount+n_Bterms-1,small2big[j]*astringcount+n_Bterms-1,mo_OEI,mo_TEI,alphae,betae,nmo);
+
+			}
+		}
+		//print_mat(initG,init_dim,init_dim,outfile);
+		fprintf(outfile,"init G P\n");
+		print_mat(initG,init_dim,init_dim,outfile);
+		for(i=0;i<init_dim;i++){
+			fprintf(outfile,"%d ",small2big[i]);
+		}
+		fprintf(outfile,"\n");
+		/*double *work = init_array(10*init_dim);
+		C_DSYEV('V','U',init_dim,initG[0],init_dim,lambda,work,10*init_dim);
+		free(work);*/
+		sq_rsp(init_dim, init_dim, initG, lambda, 1, alpha, 1e-12);
+
+		for(i=0; i < init_dim; i++) {
+			for(j=0; j < init_dim; j++){
+			b[i][small2big[j]] = alpha[j][i];
+			//b[i][small2big[j]] = initG[j][i];
+			//b[i][j] = initG[j][i];
+			}
+		}
+
+		fprintf(outfile,"DIAG init G P\n");
+		print_mat(initG,init_dim,init_dim,outfile);
+		free(small2big);
+		free_block(initG);
+	}
+	else { /* Use unit vectors as initial guesses */
+		init_dim = M;
+		Adiag = init_array(N);
+		for(i=0; i < N; i++) { 
+			Adiag[i] = build_single_Hamiltonian_element(i*astringcount+n_Bterms-1,i*astringcount+n_Bterms-1,mo_OEI,mo_TEI,alphae,betae,nmo);
+			printf("diag(%d) <%d|H|%d> = %lf\n",i,i*astringcount+n_Bterms-1,i*astringcount+n_Bterms-1,Adiag[i]);
+		}
+		for(i=0; i < init_dim; i++) {
+			minimum = Adiag[0];
+			min_pos = 0;
+			for(j=1; j < N; j++){
+				if(Adiag[j] < minimum) { 
+					minimum = Adiag[j]; min_pos = j; 
+				}
+			}
+			b[i][min_pos] = 1.0; 
+			Adiag[min_pos] = BIGNUM; 
+			lambda_old[i] = minimum;
+		}
+	}
+	//printf("init = %d\n",init_dim);
+	fprintf(outfile,"INITIAL BP\n");
+	print_mat(b,init_dim,N,outfile);
+	L = init_dim;
+	iter =0;
+	converged = 0;
+	conv = init_int_array(M); /* boolean array for convergence of each
+			       root */
+	int built = 0;
+	for(i=0;i<astringcount;i++){
+		Adiag[i] = build_single_Hamiltonian_element(i*astringcount+n_Bterms-1,i*astringcount+n_Bterms-1,mo_OEI,mo_TEI,alphae,betae,nmo);
+		printf("A(%d) = %lf\n",i,Adiag[i]);
+	}
+	while(converged < M && iter < MAXIT) {
+
+		skip_check = 0;
+		if(print){
+			 printf("\niter = %d\n", iter); 
+		}
+		fprintf(outfile,"B %d\n",iter);
+		print_mat(b,L,N,outfile);
+		for(i=built;i<L;i++){
+			//printf("%d\n",i);
+			get_factored_sigmaP(i,i,state, sigma, b/*&(b[i])*/, Q, n_Aterms, n_Bterms, alphae, betae, nmo, mo_OEI,  mo_TEI);
+			//double eee = C_DDOT(astringcount,b[i],1,sigma[i],1);
+			for(int kk = 0;kk<astringcount;kk++){
+				printf("%lf ",b[i][kk]);
+			}
+			printf("\n");
+			for(int kk = 0;kk<astringcount;kk++){
+				printf("%lf ",sigma[i][kk]);
+			}
+			printf("\n");
+			double eee = 0.0;
+			for(int kk=0;kk<astringcount;kk++){
+				eee+=b[i][kk]*sigma[i][kk];
+			}
+			printf("E = %lf\n",eee);
+			built++;
+		}
+		fprintf(outfile,"SIGMA %d\n",iter);
+		print_mat(sigma,L,N,outfile);
+		for(i=0;i<maxdim;i++){
+			for(j=0;j<maxdim;j++){
+				G[i][j]=0.0;
+			}
+		}
+		/* form mini-matrix */
+		C_DGEMM('n','t', L, L, N, 1.0, &(b[0][0]), N,&(sigma[0][0]), N, 0.0, &(G[0][0]), maxdim);
+		fprintf(outfile,"subHP %d\n",iter);
+		print_mat(G,L,L,outfile);
+		/* diagonalize mini-matrix */
+		/*double *work = init_array(10*L);
+		C_DSYEV('V','U',L,G[0],maxdim,lambda,work,10*L);
+		free(work);*/
+		sq_rsp(L, L, G, lambda, 1, alpha, 1e-12);
+
+		/* form preconditioned residue vectors */
+		for(k=0; k < M; k++) {//rows
+			for(I=0; I < N; I++) { //cols
+				f[k][I] = 0.0;
+				for(i=0; i < L; i++) {
+					f[k][I] += alpha[i][k] * (sigma[I][i] - lambda[k] * b[i][I]);
+					//f[k][I] += G[i][k] * (sigma[I][i] - lambda[k] * b[i][I]);
+				}
+				//printf(" k = %d I = %d l(k) = %lf A(I) = %lf\n",k,I,lambda[k],Adiag[I]);
+				denom = lambda[k] - Adiag[I];
+				if(fabs(denom) > 1e-6) {
+					//printf("denom = %lf\n",denom);
+					f[k][I] /= denom;
+				}
+				else{
+					f[k][I] = 0.0;
+				}
+			}
+		}
+
+		/* normalize each residual */
+		for(k=0; k < M; k++) {
+			norm = 0.0;
+			for(I=0; I < N; I++) {
+				norm += f[k][I] * f[k][I];
+			}
+			norm = sqrt(norm);
+			for(I=0; I < N; I++) {
+				if(norm > 1e-6) {
+					f[k][I] /= norm;
+				}
+				else {
+					f[k][I] = 0.0;
+				}
+			}
+		}
+
+		/* schmidt orthogonalize the f[k] against the set of b[i] and add
+		new vectors */
+		fprintf(outfile,"F %d\n",iter);
+		print_mat(f,M,N,outfile);
+		for(k=0,numf=0; k < M; k++){
+			if(schmidt_add(b, L, N, f[k])) { 
+				printf("added\n");L++; numf++; 
+			}
+		}
+
+		/* If L is close to maxdim, collapse to one guess per root */
+		if(maxdim - L < M) {
+			if(print) {
+				printf("Subspace too large: maxdim = %d, L = %d\n", maxdim, L);
+				printf("Collapsing eigenvectors.\n");
+			}
+			for(i=0; i < M; i++) {
+				memset((void *) bnew[i], 0, N*sizeof(double));
+				for(j=0; j < L; j++) {
+					for(k=0; k < N; k++) {
+						bnew[i][k] += alpha[j][i] * b[j][k];
+						//bnew[i][k] += G[j][i] * b[j][k];
+					}
+				}
+			}
+			/* copy new vectors into place */
+			for(i=0; i < M; i++){ 
+				for(k=0; k < N; k++){
+					b[i][k] = bnew[i][k];
+				}
+			}
+			skip_check = 1;
+			built = 0;
+			L = M;
+		}
+
+		/* check convergence on all roots */
+		if(!skip_check) {
+			converged = 0;
+			zero_int_array(conv, M);
+			if(print) {
+				printf("Root      Eigenvalue       Delta  Converged?\n");
+				printf("---- -------------------- ------- ----------\n");
+			}
+			for(k=0; k < M; k++) {
+				diff = fabs(lambda[k] - lambda_old[k]);
+				if(diff < cutoff) {
+					conv[k] = 1;
+					converged++;
+				}
+				lambda_old[k] = lambda[k];
+				if(print) {
+					printf("%3d  %20.14f %4.3e    %1s\n", k, lambda[k], diff,
+					 conv[k] == 1 ? "Y" : "N");
+				}
+			}
+		}
+
+		iter++;
+	}
+
+	/* generate final eigenvalues and eigenvectors */
+	if(converged == M) {
+	double **v = block_matrix(N,M);
+		for(i=0; i < M; i++) {
+		//eps[i] = lambda[i];
+			for(j=0; j < L; j++) {
+				for(I=0; I < N; I++) {
+					//v[I][i] += alpha[j][i] * b[j][I];
+					v[I][i] += G[j][i] * b[j][I];
+				}
+			}
+		}
+		if(print) printf("Davidson algorithm converged in %d iterations.\n", iter);
+		for(I=0;I<N;I++){
+			P[state][(n_Aterms-1)*astringcount+I]=v[I][0];
+		}
+	fprintf(outfile,"Eigenvectors P\n");
+	print_mat(v,N,M,outfile);
+	}
+
+  free(conv);
+  free_block(b);
+  free_block(bnew);
+  free_block(sigma);
+  free_block(G);
+  free_block(f);
+  free_block(alpha);
+  free(lambda);
+  free(lambda_old);
+
+  return converged;
+}
+int davidQ(int state, int M, double **P, double **Q, int n_Aterms, int n_Bterms, int alphae, int betae, int nmo, double **mo_OEI, double *mo_TEI,int print)
+{
+	int i, j, k, L, I;
+	double minimum;
+	int min_pos, numf, iter, *conv, converged, maxdim, skip_check;
+	int *small2big, init_dim;
+	int smart_guess = 0;
+	double *Adiag, **b, **bnew, **sigma, **G;
+	double *lambda, **alpha, **f, *lambda_old;
+	double norm, denom, diff;
+	double BIGNUM = 10E100;
+	int MAXIT = 1000;
+	double cutoff = 10E-6;
+	int astringcount = nchoosek(nmo,alphae);
+	int bstringcount = nchoosek(nmo,betae);
+	int N = bstringcount;
+	maxdim = 8 * M;
+
+	b = block_matrix(maxdim, N);  /* current set of guess vectors,
+				   stored by row */
+	bnew = block_matrix(M, N); /* guess vectors formed from old vectors,
+				stored by row*/
+	sigma = block_matrix(N, maxdim); /* sigma vectors, stored by column */
+	G = block_matrix(maxdim, maxdim); /* Davidson mini-Hamitonian */
+	f = block_matrix(maxdim, N); /* residual eigenvectors, stored by row */
+	alpha = block_matrix(maxdim, maxdim); /* eigenvectors of G */
+	lambda = init_array(maxdim); /* eigenvalues of G */
+	lambda_old = init_array(maxdim); /* approximate roots from previous
+				      iteration */
+
+	if(smart_guess) { /* Use eigenvectors of a sub-matrix as initial guesses */
+		if(N > 7*M){
+			init_dim = 7*M;
+		}
+		else{ 
+			init_dim = M;
+		}
+		Adiag = init_array(N);
+		small2big = init_int_array(7*M);
+		for(i=0; i < N; i++) { 
+			Adiag[i] = build_single_Hamiltonian_element((n_Aterms-1)*astringcount+i,(n_Aterms-1)*astringcount+i,mo_OEI,mo_TEI,alphae,betae,nmo);
+		}
+		for(i=0; i < init_dim; i++) {
+			minimum = Adiag[0];
+			min_pos = 0;
+			for(j=1; j < N; j++){
+				if(Adiag[j] < minimum) {	
+					minimum = Adiag[j]; 
+					min_pos = j; 
+					small2big[i] = j; 
+				}
+			}
+			Adiag[min_pos] = BIGNUM;
+			lambda_old[i] = minimum;
+		}
+		for(i=0; i < init_dim; i++) {
+			for(j=0; j < init_dim; j++){
+			//G[i][j] = A[small2big[i]][small2big[j]];
+			}
+		}
+
+		sq_rsp(init_dim, init_dim, G, lambda, 1, alpha, 1e-12);
+
+		for(i=0; i < init_dim; i++) {
+			for(j=0; j < init_dim; j++){
+			b[i][small2big[j]] = alpha[j][i];
+			}
+		}
+
+		free(small2big);
+	}
+	else { /* Use unit vectors as initial guesses */
+		init_dim = M;
+		Adiag = init_array(N);
+		for(i=0; i < N; i++) { 
+			Adiag[i] = build_single_Hamiltonian_element((n_Aterms-1)*astringcount+i,(n_Aterms-1)*astringcount+i,mo_OEI,mo_TEI,alphae,betae,nmo);
+			//printf("diag(%d) <%d|H|%d> = %lf\n",i,i*astringcount+n_Bterms-1,i*astringcount+n_Bterms-1,Adiag[i]);
+		}
+		for(i=0; i < init_dim; i++) {
+			minimum = Adiag[0];
+			min_pos = 0;
+			for(j=1; j < N; j++){
+				if(Adiag[j] < minimum) { 
+					minimum = Adiag[j]; min_pos = j; 
+				}
+			}
+			b[i][min_pos] = 1.0; 
+			Adiag[min_pos] = BIGNUM; 
+			lambda_old[i] = minimum;
+		}
+	}
+	//printf("init = %d\n",init_dim);
+	fprintf(outfile,"INITIAL B\n");
+	print_mat(b,init_dim,N,outfile);
+	L = init_dim;
+	iter =0;
+	converged = 0;
+	conv = init_int_array(M); /* boolean array for convergence of each
+			       root */
+	int built = 0;
+	while(converged < M && iter < MAXIT) {
+
+		skip_check = 0;
+		if(print){
+			 printf("\niter = %d\n", iter); 
+		}
+		for(i=built;i<L;i++){
+			//printf("%d\n",i);
+			get_factored_sigmaQ(i,state, sigma, P,&(b[i]), n_Aterms, n_Bterms, alphae, betae, nmo, mo_OEI,  mo_TEI);
+			built++;
+		}
+		fprintf(outfile,"SIGMA %d\n",iter);
+		print_mat(sigma,L,N,outfile);
+		/* form mini-matrix */
+		C_DGEMM('n','n', L, L, N, 1.0, &(b[0][0]), N,&(sigma[0][0]), maxdim, 0.0, &(G[0][0]), maxdim);
+
+		/* diagonalize mini-matrix */
+		sq_rsp(L, L, G, lambda, 1, alpha, 1e-12);
+
+		/* form preconditioned residue vectors */
+		for(k=0; k < M; k++) {//rows
+			for(I=0; I < N; I++) { //cols
+				f[k][I] = 0.0;
+				for(i=0; i < L; i++) {
+					f[k][I] += alpha[i][k] * (sigma[I][i] - lambda[k] * b[i][I]);
+				}
+				denom = lambda[k] - Adiag[I];
+				if(fabs(denom) > 1e-6) {
+					f[k][I] /= denom;
+				}
+				else{
+					f[k][I] = 0.0;
+				}
+			}
+		}
+
+		/* normalize each residual */
+		for(k=0; k < M; k++) {
+			norm = 0.0;
+			for(I=0; I < N; I++) {
+				norm += f[k][I] * f[k][I];
+			}
+			norm = sqrt(norm);
+			for(I=0; I < N; I++) {
+				if(norm > 1e-6) {
+					f[k][I] /= norm;
+				}
+				else {
+					f[k][I] = 0.0;
+				}
+			}
+		}
+
+		/* schmidt orthogonalize the f[k] against the set of b[i] and add
+		new vectors */
+		for(k=0,numf=0; k < M; k++){
+			if(schmidt_add(b, L, N, f[k])) { 
+				L++; numf++; 
+			}
+		}
+
+		/* If L is close to maxdim, collapse to one guess per root */
+		if(maxdim - L < M) {
+			if(print) {
+				printf("Subspace too large: maxdim = %d, L = %d\n", maxdim, L);
+				printf("Collapsing eigenvectors.\n");
+			}
+			for(i=0; i < M; i++) {
+				memset((void *) bnew[i], 0, N*sizeof(double));
+				for(j=0; j < L; j++) {
+					for(k=0; k < N; k++) {
+						bnew[i][k] += alpha[j][i] * b[j][k];
+					}
+				}
+			}
+			/* copy new vectors into place */
+			for(i=0; i < M; i++){ 
+				for(k=0; k < N; k++){
+					b[i][k] = bnew[i][k];
+				}
+			}
+			skip_check = 1;
+			built = 0;
+			L = M;
+		}
+
+		/* check convergence on all roots */
+		if(!skip_check) {
+			converged = 0;
+			zero_int_array(conv, M);
+			if(print) {
+				printf("Root      Eigenvalue       Delta  Converged?\n");
+				printf("---- -------------------- ------- ----------\n");
+			}
+			for(k=0; k < M; k++) {
+				diff = fabs(lambda[k] - lambda_old[k]);
+				if(diff < cutoff) {
+					conv[k] = 1;
+					converged++;
+				}
+				lambda_old[k] = lambda[k];
+				if(print) {
+					printf("%3d  %20.14f %4.3e    %1s\n", k, lambda[k], diff,
+					 conv[k] == 1 ? "Y" : "N");
+				}
+			}
+		}
+
+		iter++;
+	}
+
+	/* generate final eigenvalues and eigenvectors */
+	if(converged == M) {
+	double **v = block_matrix(N,M);
+		for(i=0; i < M; i++) {
+		//eps[i] = lambda[i];
+			for(j=0; j < L; j++) {
+				for(I=0; I < N; I++) {
+					v[I][i] += alpha[j][i] * b[j][I];
+				}
+			}
+		}
+		if(print) printf("Davidson algorithm converged in %d iterations.\n", iter);
+		for(I=0;I<N;I++){
+			Q[state][(n_Bterms-1)*bstringcount+I]=v[I][0];
+		}
+	print_mat(v,N,M,outfile);
+	}
+
+  free(conv);
+  free_block(b);
+  free_block(bnew);
+  free_block(sigma);
+  free_block(G);
+  free_block(f);
+  free_block(alpha);
+  free(lambda);
+  free(lambda_old);
+
+  return converged;
+}
+
+}}

@@ -1,0 +1,17 @@
+molecule n {
+N
+
+symmetry c1
+}
+
+plugin_load("./variational_decomp_fci.so")
+
+set {
+  basis sto-3g
+  df_basis_scf cc-pvdz-jkfit
+}
+
+set reference uhf
+energy('scf')
+
+plugin("./variational_decomp_fci.so")

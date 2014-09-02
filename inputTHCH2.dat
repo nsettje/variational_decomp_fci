@@ -1,0 +1,42 @@
+molecule h2 {
+H
+H 1 R
+
+R = .74
+symmetry c1
+}
+
+plugin_load("./variational_decomp_fci.so")
+
+set {
+	basis			cc-pvdz
+	df_basis_scf		cc-pvdz-jkfit
+	df_basis_mp2		cc-pvdz-ri
+
+	dvr_basis_int		aug-cc-pvtz-ri
+
+	scf_type		df
+	reference		rhf	
+	guess			sad
+	freeze_core		large
+	d_convergence		1.0e-8
+
+	thc_balance		false
+	thc_df_lsthc		true
+	bench			1
+
+	lrdf_grid		rdvr
+	lrdf_grid_maxl		7
+	lrdf_grid_pruning	erf
+	
+	factorization		thc_mo
+	thc_amplitudes		false
+}
+
+set plugin_example {
+	print 1
+}
+
+energy('scf')
+
+plugin("./variational_decomp_fci.so")
